@@ -16,6 +16,7 @@ const WHITE: &str = "\x1b[38;5;255m";
 const EXT_MAP: &[&str] = &[
     "rs", "ts", "tsx", "js", "jsx", "py", "toml",
     "json", "md", "html", "css", "sh", "sol", "go", "yaml", "yml",
+    "c", "h", "cpp", "hpp", "cc",
 ];
 
 const ALWAYS_SKIP: &[&str] = &[
