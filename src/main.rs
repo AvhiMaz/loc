@@ -43,7 +43,157 @@ fn count_lines(path: &Path) -> usize {
     BufReader::new(f).lines().count()
 }
 
-fn scan_repo(repo: &Path) -> usize {
+struct Syntax {
+    line: &'static [&'static str],
+    block: Option<(&'static str, &'static str)>,
+    nested: bool,
+    // (delimiter, may span lines)
+    quotes: &'static [(&'static str, bool)],
+    // 'x' is a char literal, not a string (rust, c, go)
+    char_lits: bool,
+}
+
+const C_LIKE: Syntax = Syntax {
+    line: &["//"],
+    block: Some(("/*", "*/")),
+    nested: false,
+    quotes: &[("\"", false)],
+    char_lits: true,
+};
+
+const HASH: Syntax = Syntax {
+    line: &["#"],
+    block: None,
+    nested: false,
+    quotes: &[("\"", false), ("'", false)],
+    char_lits: false,
+};
+
+fn syntax_for(ext: &str) -> Option<Syntax> {
+    let s = match ext {
+        "rs" => Syntax { nested: true, quotes: &[("\"", true)], ..C_LIKE },
+        "c" | "h" | "cpp" | "hpp" | "cc" => C_LIKE,
+        "go" => Syntax { quotes: &[("\"", false), ("`", true)], ..C_LIKE },
+        "js" | "jsx" | "ts" | "tsx" => Syntax {
+            quotes: &[("\"", false), ("'", false), ("`", true)],
+            char_lits: false,
+            ..C_LIKE
+        },
+        "sol" => Syntax { quotes: &[("\"", false), ("'", false)], char_lits: false, ..C_LIKE },
+        "css" => Syntax { line: &[], quotes: &[("\"", false), ("'", false)], char_lits: false, ..C_LIKE },
+        "py" | "toml" => Syntax {
+            quotes: &[("\"\"\"", true), ("'''", true), ("\"", false), ("'", false)],
+            ..HASH
+        },
+        "sh" | "yaml" | "yml" => HASH,
+        "html" | "md" => Syntax {
+            line: &[],
+            block: Some(("<!--", "-->")),
+            nested: false,
+            quotes: &[],
+            char_lits: false,
+        },
+        _ => return None,
+    };
+    Some(s)
+}
+
+enum State {
+    Code,
+    Block(usize),
+    Str(&'static str, bool),
+}
+
+// returns true if the line has anything outside a comment
+fn has_code(line: &[u8], syn: &Syntax, state: &mut State) -> bool {
+    let mut code = false;
+    let mut i = 0;
+    while i < line.len() {
+        let rest = &line[i..];
+        match state {
+            State::Block(depth) => {
+                let (open, close) = syn.block.unwrap();
+                if syn.nested && rest.starts_with(open.as_bytes()) {
+                    *depth += 1;
+                    i += open.len();
+                } else if rest.starts_with(close.as_bytes()) {
+                    *depth -= 1;
+                    if *depth == 0 {
+                        *state = State::Code;
+                    }
+                    i += close.len();
+                } else {
+                    i += 1;
+                }
+            }
+            State::Str(q, _) => {
+                code = true;
+                if line[i] == b'\\' {
+                    i += 2;
+                } else if rest.starts_with(q.as_bytes()) {
+                    i += q.len();
+                    *state = State::Code;
+                } else {
+                    i += 1;
+                }
+            }
+            State::Code => {
+                if line[i].is_ascii_whitespace() {
+                    i += 1;
+                } else if syn.line.iter().any(|l| rest.starts_with(l.as_bytes())) {
+                    break;
+                } else if let Some((open, _)) = syn.block.filter(|(o, _)| rest.starts_with(o.as_bytes())) {
+                    *state = State::Block(1);
+                    i += open.len();
+                } else if let Some(&(q, multi)) = syn.quotes.iter().find(|(q, _)| rest.starts_with(q.as_bytes())) {
+                    code = true;
+                    *state = State::Str(q, multi);
+                    i += q.len();
+                } else if syn.char_lits && line[i] == b'\'' {
+                    code = true;
+                    if rest.get(1) == Some(&b'\\') {
+                        // escaped char like '\'' or '\n': skip to the closing quote
+                        let close = rest.iter().skip(3).position(|&c| c == b'\'');
+                        i += close.map_or(rest.len(), |p| p + 4);
+                    } else if rest.get(2) == Some(&b'\'') {
+                        i += 3;
+                    } else {
+                        // lifetime or multibyte char
+                        i += 1;
+                    }
+                } else {
+                    code = true;
+                    i += 1;
+                }
+            }
+        }
+    }
+    if let State::Str(_, false) = state {
+        *state = State::Code;
+    }
+    code
+}
+
+fn count_code_lines(path: &Path, syn: &Syntax) -> usize {
+    let Ok(bytes) = fs::read(path) else { return 0 };
+    let mut state = State::Code;
+    let mut lines = bytes.split(|&b| b == b'\n').peekable();
+    let mut n = 0;
+    while let Some(line) = lines.next() {
+        // trailing newline doesn't start a new line
+        if lines.peek().is_none() && line.is_empty() {
+            break;
+        }
+        let blank = line.iter().all(|b| b.is_ascii_whitespace());
+        let in_comment = matches!(state, State::Block(_));
+        if (blank && !in_comment) || has_code(line, syn, &mut state) {
+            n += 1;
+        }
+    }
+    n
+}
+
+fn scan_repo(repo: &Path, no_comments: bool) -> usize {
     tracked_files(repo)
         .into_iter()
         .filter(|p| {
@@ -54,7 +204,13 @@ fn scan_repo(repo: &Path) -> usize {
             let ext = p.extension().and_then(|e| e.to_str()).unwrap_or("").to_lowercase();
             EXT_MAP.contains(&ext.as_str())
         })
-        .map(|p| count_lines(&p))
+        .map(|p| {
+            let ext = p.extension().and_then(|e| e.to_str()).unwrap_or("").to_lowercase();
+            match syntax_for(&ext) {
+                Some(syn) if no_comments => count_code_lines(&p, &syn),
+                _ => count_lines(&p),
+            }
+        })
         .sum()
 }
 
@@ -95,16 +251,36 @@ fn fmt_loc(n: usize) -> String {
     out.chars().rev().collect()
 }
 
-fn root_dir() -> PathBuf {
-    let mut args = std::env::args().skip(1);
-    if let Some(arg) = args.next() {
-        return PathBuf::from(arg);
+const USAGE: &str = "usage: loc [path] [--no-comments]";
+
+struct Args {
+    root: PathBuf,
+    no_comments: bool,
+}
+
+fn parse_args() -> Args {
+    let mut root = None;
+    let mut no_comments = false;
+    for arg in std::env::args().skip(1) {
+        match arg.as_str() {
+            "--no-comments" => no_comments = true,
+            "-h" | "--help" => {
+                println!("{USAGE}");
+                std::process::exit(0);
+            }
+            a if a.starts_with('-') => {
+                eprintln!("unknown flag: {a}\n{USAGE}");
+                std::process::exit(1);
+            }
+            _ => root = Some(PathBuf::from(arg)),
+        }
     }
-    std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))
+    let root = root.unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
+    Args { root, no_comments }
 }
 
 fn main() {
-    let root = root_dir();
+    let Args { root, no_comments } = parse_args();
 
     let repos = if root.join(".git").exists() {
         vec![root.clone()]
@@ -121,7 +297,7 @@ fn main() {
     let mut results: Vec<(String, usize)> = repos
         .iter()
         .filter_map(|r| {
-            let loc = scan_repo(r);
+            let loc = scan_repo(r, no_comments);
             if loc > 0 {
                 let name = if r == &root {
                     label.to_string()
@@ -143,7 +319,8 @@ fn main() {
     let sep_w = name_w + 38;
 
     println!();
-    println!("  {BOLD}{WHITE}lines of code{RESET}  {DIM}{GRAY}{label}{RESET}");
+    let title = if no_comments { "lines of code (no comments)" } else { "lines of code" };
+    println!("  {BOLD}{WHITE}{title}{RESET}  {DIM}{GRAY}{label}{RESET}");
     println!("  {GRAY}{}{RESET}", "─".repeat(sep_w));
     println!();
 
