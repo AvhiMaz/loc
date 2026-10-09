@@ -18,7 +18,14 @@ loc
 
 # count LOC in a specific path
 loc ~/dev/myproject
+
+# skip comment lines
+loc --no-comments ~/dev/myproject
 ```
+
+`--no-comments` drops lines that only contain comments (`//`, `/* */`, `#`, `<!-- -->`
+depending on the language). lines with code followed by a trailing comment still count,
+and comment markers inside strings are ignored.
 
 if the target is a git repo, it counts that single repo.
 if it contains multiple git repos, it lists each one separately.
